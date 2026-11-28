@@ -1,0 +1,41 @@
+name: xgboost-gpu-warning-check
+
+on:
+  push:
+    branches: [ci/xgboost-gpu-warning]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    env:
+      GOPATH: ${{ github.workspace }}/go
+    defaults:
+      run:
+        shell: bash -o pipefail -e {0}
+        working-directory: ${{ env.GOPATH }}/src/github.com/kubeflow/trainer
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: ${{ env.GOPATH }}/src/github.com/kubeflow/trainer
+          fetch-depth: 5
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: ${{ env.GOPATH }}/src/github.com/kubeflow/trainer/go.mod
+      - name: Drop the CI-only workflow so diff checks see only the change
+        run: git rm -q --cached .github/workflows/xgboost-gpu-warning-check.yaml && rm .github/workflows/xgboost-gpu-warning-check.yaml && git -c user.name=ci -c user.email=ci@local commit -q -m drop-ci
+      - name: Check auto-generated assets
+        run: |
+          make generate
+          git status --short
+          git diff --exit-code || (echo 'make generate changed files' && exit 1)
+      - name: Check go fmt and vet
+        run: |
+          make fmt
+          git diff --exit-code
+          make vet
+      - name: golangci-lint
+        run: make golangci-lint
+      - name: Runtime and API tests
+        run: go test ./pkg/runtime/... ./pkg/apis/... ./pkg/webhooks/... 2>&1 | tail -40
+      - name: XGBoost plugin tests, verbose
+        run: go test ./pkg/runtime/framework/plugins/xgboost/ -run 'TestXGBoost' -v 2>&1 | grep -E '^\s*--- |^(PASS|FAIL|ok)'
