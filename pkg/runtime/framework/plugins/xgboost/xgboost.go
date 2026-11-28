@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/utils/ptr"
@@ -41,6 +42,11 @@ var _ framework.CustomValidationPlugin = (*XGBoost)(nil)
 
 const Name = "XGBoost"
 
+// multiGPUPerNodeWarning is returned when a node requests more than one GPU, since each node
+// runs a single XGBoost worker and that worker uses one GPU.
+const multiGPUPerNodeWarning = "the XGBoost runtime runs one worker per node and each worker uses one GPU, " +
+	"so the other GPUs requested per node are not used. Request one GPU per node and scale out with spec.trainer.numNodes"
+
 func New(context.Context, client.Client, client.FieldIndexer, *configapi.Configuration) (framework.Plugin, error) {
 	return &XGBoost{}, nil
 }
@@ -49,8 +55,9 @@ func (x *XGBoost) Name() string {
 	return Name
 }
 
-func (x *XGBoost) Validate(_ context.Context, runtimeInfo *runtime.Info, _, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
+func (x *XGBoost) Validate(_ context.Context, runtimeInfo *runtime.Info, oldObj, newObj *trainer.TrainJob) (admission.Warnings, field.ErrorList) {
 	var allErrs field.ErrorList
+	var warnings admission.Warnings
 	if runtimeInfo == nil || runtimeInfo.RuntimePolicy.MLPolicySource == nil ||
 		runtimeInfo.RuntimePolicy.MLPolicySource.XGBoost == nil {
 		return nil, allErrs
@@ -70,7 +77,17 @@ func (x *XGBoost) Validate(_ context.Context, runtimeInfo *runtime.Info, _, newO
 			}
 		}
 	}
-	return nil, allErrs
+	// Warn only on create, so an existing TrainJob does not repeat the warning on every update.
+	if oldObj == nil {
+		resourcesPerNode := ptr.Deref(runtime.ExtractResourcePerNodeFromRuntime(runtimeInfo), corev1.ResourceRequirements{})
+		if jobTrainer := newObj.Spec.Trainer; jobTrainer != nil && jobTrainer.ResourcesPerNode != nil {
+			resourcesPerNode = *jobTrainer.ResourcesPerNode
+		}
+		if runtime.GetNumGPUPerNode(&resourcesPerNode) > 1 {
+			warnings = append(warnings, multiGPUPerNodeWarning)
+		}
+	}
+	return warnings, allErrs
 }
 
 func (x *XGBoost) EnforceMLPolicy(info *runtime.Info, trainJob *trainer.TrainJob) error {

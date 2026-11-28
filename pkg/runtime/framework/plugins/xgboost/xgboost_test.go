@@ -31,6 +31,7 @@ import (
 	corev1ac "k8s.io/client-go/applyconfigurations/core/v1"
 	"k8s.io/klog/v2/ktesting"
 	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 	jobsetv1alpha2ac "sigs.k8s.io/jobset/client-go/applyconfiguration/jobset/v1alpha2"
 
 	trainer "github.com/kubeflow/trainer/v2/pkg/apis/trainer/v1alpha1"
@@ -42,9 +43,11 @@ import (
 
 func TestXGBoostValidate(t *testing.T) {
 	cases := map[string]struct {
-		runtimeInfo *runtime.Info
-		trainJob    *trainer.TrainJob
-		wantErrs    field.ErrorList
+		runtimeInfo  *runtime.Info
+		oldObj       *trainer.TrainJob
+		trainJob     *trainer.TrainJob
+		wantErrs     field.ErrorList
+		wantWarnings admission.Warnings
 	}{
 		"no error when runtimeInfo is nil": {
 			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
@@ -218,6 +221,121 @@ func TestXGBoostValidate(t *testing.T) {
 				),
 			},
 		},
+		"warning when the TrainJob requests more than one GPU per node": {
+			runtimeInfo: runtime.NewInfo(
+				runtime.WithMLPolicySource(
+					utiltesting.MakeMLPolicyWrapper().
+						WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+							XGBoostPolicy().
+							Obj(),
+						).
+						Obj(),
+				),
+			),
+			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(
+					utiltesting.MakeTrainJobTrainerWrapper().
+						NumNodes(2).
+						Container("xgboost/xgboost:latest", nil, nil, corev1.ResourceList{
+							"example.com/gpu": resource.MustParse("4"),
+						}).
+						Obj(),
+				).
+				Obj(),
+			wantWarnings: admission.Warnings{multiGPUPerNodeWarning},
+		},
+		"no warning when the TrainJob requests one GPU per node": {
+			runtimeInfo: runtime.NewInfo(
+				runtime.WithMLPolicySource(
+					utiltesting.MakeMLPolicyWrapper().
+						WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+							XGBoostPolicy().
+							Obj(),
+						).
+						Obj(),
+				),
+			),
+			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(
+					utiltesting.MakeTrainJobTrainerWrapper().
+						NumNodes(2).
+						Container("xgboost/xgboost:latest", nil, nil, corev1.ResourceList{
+							"example.com/gpu": resource.MustParse("1"),
+						}).
+						Obj(),
+				).
+				Obj(),
+		},
+		"no warning when an existing TrainJob with more than one GPU per node is updated": {
+			runtimeInfo: runtime.NewInfo(
+				runtime.WithMLPolicySource(
+					utiltesting.MakeMLPolicyWrapper().
+						WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+							XGBoostPolicy().
+							Obj(),
+						).
+						Obj(),
+				),
+			),
+			oldObj: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(
+					utiltesting.MakeTrainJobTrainerWrapper().
+						NumNodes(2).
+						Container("xgboost/xgboost:latest", nil, nil, corev1.ResourceList{
+							"example.com/gpu": resource.MustParse("4"),
+						}).
+						Obj(),
+				).
+				Obj(),
+			trainJob: utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").
+				Trainer(
+					utiltesting.MakeTrainJobTrainerWrapper().
+						NumNodes(2).
+						Container("xgboost/xgboost:latest", nil, nil, corev1.ResourceList{
+							"example.com/gpu": resource.MustParse("4"),
+						}).
+						Obj(),
+				).
+				Obj(),
+		},
+		"warning when the runtime requests more than one GPU per node": {
+			runtimeInfo: runtime.NewInfo(
+				runtime.WithMLPolicySource(
+					utiltesting.MakeMLPolicyWrapper().
+						WithMLPolicySource(*utiltesting.MakeMLPolicySourceWrapper().
+							XGBoostPolicy().
+							Obj(),
+						).
+						Obj(),
+				),
+				runtime.WithTemplateSpecObjApply(
+					jobsetv1alpha2ac.JobSetSpec().
+						WithReplicatedJobs(
+							jobsetv1alpha2ac.ReplicatedJob().
+								WithName(constants.Node).
+								WithTemplate(batchv1ac.JobTemplateSpec().
+									WithSpec(batchv1ac.JobSpec().
+										WithTemplate(corev1ac.PodTemplateSpec().
+											WithSpec(corev1ac.PodSpec().
+												WithContainers(
+													corev1ac.Container().
+														WithName(constants.Node).
+														WithResources(corev1ac.ResourceRequirements().
+															WithLimits(corev1.ResourceList{
+																"example.com/gpu": resource.MustParse("2"),
+															}),
+														),
+												),
+											),
+										),
+									),
+								),
+						),
+				),
+			),
+			trainJob:     utiltesting.MakeTrainJobWrapper(metav1.NamespaceDefault, "test-job").Obj(),
+			wantWarnings: admission.Warnings{multiGPUPerNodeWarning},
+		},
 	}
 
 	for name, tc := range cases {
@@ -233,9 +351,12 @@ func TestXGBoostValidate(t *testing.T) {
 			}
 
 			// Test Validate
-			_, errs := p.(framework.CustomValidationPlugin).Validate(ctx, tc.runtimeInfo, nil, tc.trainJob)
+			warnings, errs := p.(framework.CustomValidationPlugin).Validate(ctx, tc.runtimeInfo, tc.oldObj, tc.trainJob)
 			if diff := cmp.Diff(tc.wantErrs, errs, cmpopts.IgnoreFields(field.Error{}, "Detail")); len(diff) != 0 {
 				t.Errorf("Unexpected validation errors (-want,+got):\n%s", diff)
+			}
+			if diff := cmp.Diff(tc.wantWarnings, warnings); len(diff) != 0 {
+				t.Errorf("Unexpected validation warnings (-want,+got):\n%s", diff)
 			}
 		})
 	}
